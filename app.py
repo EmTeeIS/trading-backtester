@@ -155,6 +155,17 @@ def run_backtest(
     aligned = pd.DataFrame({"price": prices, "position": signals}).dropna()
     aligned["position"] = aligned["position"].astype(int)
 
+    if len(aligned) < 2:
+        empty = pd.Series(dtype=float)
+        return BacktestResult(
+            strategy_key=strategy_key,
+            ticker=prices.name or "ASSET",
+            equity_curve=empty,
+            daily_returns=empty,
+            trades=[],
+            metrics=empty_metrics(),
+        )
+
     daily_rets: List[float] = []
     trades: List[Trade] = []
     entry_date: Optional[pd.Timestamp] = None
@@ -227,6 +238,17 @@ def run_backtest(
 
 def buy_and_hold(prices: pd.Series) -> BacktestResult:
     aligned = prices.dropna()
+    if len(aligned) < 2:
+        empty = pd.Series(dtype=float)
+        return BacktestResult(
+            strategy_key="buy_hold",
+            ticker=prices.name or BENCHMARK,
+            equity_curve=empty,
+            daily_returns=empty,
+            trades=[],
+            metrics=empty_metrics(),
+        )
+
     daily_ret = aligned.pct_change().fillna(0)
     equity = (1 + daily_ret).cumprod()
     trades: List[Trade] = []
@@ -257,7 +279,10 @@ def compute_metrics(
     daily_returns: pd.Series,
     trades: List[Trade],
 ) -> Dict[str, float]:
-    total_return = (equity.iloc[-1] / equity.iloc[0] - 1) * 100 if len(equity) > 0 else 0.0
+    if len(equity) < 2:
+        return empty_metrics(trades)
+
+    total_return = (equity.iloc[-1] / equity.iloc[0] - 1) * 100
 
     rf_daily = RISK_FREE_RATE / TRADING_DAYS
     excess = daily_returns - rf_daily
@@ -295,9 +320,51 @@ def period_return(equity: pd.Series, start: str, end: str) -> float:
     return (sub.iloc[-1] / sub.iloc[0] - 1) * 100
 
 
+def has_min_rows(series: pd.Series, min_rows: int = 2) -> bool:
+    return series is not None and len(series) >= min_rows
+
+
+def empty_metrics(trades: Optional[List[Trade]] = None) -> Dict[str, float]:
+    closed = trades or []
+    wins = sum(1 for t in closed if t.return_pct > 0)
+    return {
+        "total_return": 0.0,
+        "sharpe": 0.0,
+        "sortino": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": (wins / len(closed) * 100) if closed else 0.0,
+        "num_trades": len(closed),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Plotly charts
 # ---------------------------------------------------------------------------
+
+
+def build_empty_figure(message: str = "No data available") -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        height=480,
+        margin=dict(l=40, r=20, t=50, b=40),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        annotations=[
+            dict(
+                text=message,
+                xref="paper",
+                yref="paper",
+                x=0.5,
+                y=0.5,
+                showarrow=False,
+                font=dict(size=16, color="#9ca3af"),
+            )
+        ],
+    )
+    return fig
 
 
 def build_equity_chart(
@@ -306,6 +373,9 @@ def build_equity_chart(
     strategy_name: str,
     ticker: str,
 ) -> go.Figure:
+    if not has_min_rows(strategy_eq) or not has_min_rows(benchmark_eq):
+        return build_empty_figure("No data available")
+
     strat_pct = (strategy_eq / strategy_eq.iloc[0] - 1) * 100
     bench_pct = (benchmark_eq / benchmark_eq.iloc[0] - 1) * 100
 
@@ -608,7 +678,7 @@ def main() -> None:
     bench_metrics = benchmark_result.metrics
 
     # Pre-compute all strategy results (cached in session)
-    if "all_results_v3" not in st.session_state:
+    if "all_results_v4" not in st.session_state:
         all_results: Dict[str, Dict[str, BacktestResult]] = {}
         for strat_key in SIGNAL_GENERATORS:
             all_results[strat_key] = {}
@@ -618,9 +688,9 @@ def main() -> None:
                 series = price_data[ticker].copy()
                 series.name = ticker
                 all_results[strat_key][ticker] = run_backtest(series, strat_key)
-        st.session_state["all_results_v3"] = all_results
+        st.session_state["all_results_v4"] = all_results
 
-    all_results = st.session_state["all_results_v3"]
+    all_results = st.session_state["all_results_v4"]
 
     # Top row — selectors
     col_s, col_t, _ = st.columns([2, 2, 4])
