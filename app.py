@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,8 @@ END_DATE = "2023-12-31"
 RISK_FREE_RATE = 0.045
 TX_COST = 0.001  # 0.1 % per trade (entry or exit)
 TRADING_DAYS = 252
+MAX_DOWNLOAD_ATTEMPTS = 3
+RETRY_WAIT_SECONDS = 2
 
 STRESS_PERIODS: Dict[str, Tuple[str, str]] = {
     "COVID Crash": ("2020-02-19", "2020-03-23"),
@@ -44,35 +47,121 @@ STRATEGY_NAMES = {
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False)
-def download_price_data() -> Dict[str, pd.Series]:
-    """Download adjusted close prices for all tickers + benchmark."""
-    all_tickers = list(dict.fromkeys(TICKERS + [BENCHMARK]))
+def to_naive_datetime_index(index: pd.Index) -> pd.DatetimeIndex:
+    """Convert any datetime index to timezone-naive for safe comparisons."""
+    dt_index = pd.DatetimeIndex(pd.to_datetime(index))
+    if dt_index.tz is not None:
+        return dt_index.tz_convert(None)
+    return dt_index
+
+
+def to_naive_timestamp(value: str | pd.Timestamp) -> pd.Timestamp:
+    """Parse a date string/timestamp as timezone-naive."""
+    ts = pd.Timestamp(value)
+    if ts.tz is not None:
+        return ts.tz_convert(None)
+    return ts
+
+
+def ensure_naive_series(series: pd.Series) -> pd.Series:
+    """Return a copy of the series with a timezone-naive datetime index."""
+    if series is None or len(series) == 0:
+        return series
+    out = series.copy()
+    out.index = to_naive_datetime_index(out.index)
+    return out
+
+
+def _parse_yfinance_frame(raw: pd.DataFrame, all_tickers: List[str]) -> pd.DataFrame:
+    if raw.empty:
+        raise ValueError("Yahoo Finance returned an empty dataset.")
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" not in raw.columns.get_level_values(0):
+            raise ValueError("Yahoo Finance response is missing Close prices.")
+        prices = raw["Close"].copy()
+    elif "Close" in raw.columns:
+        prices = raw[["Close"]].copy()
+        prices.columns = [all_tickers[0]]
+    else:
+        raise ValueError("Yahoo Finance response has an unexpected format.")
+
+    prices = prices.dropna(how="all").sort_index()
+    prices.index = to_naive_datetime_index(prices.index)
+    return prices.loc[to_naive_timestamp(START_DATE) : to_naive_timestamp(END_DATE)]
+
+
+def _download_ticker_series(ticker: str) -> pd.Series:
     raw = yf.download(
-        all_tickers,
+        ticker,
         start=START_DATE,
         end="2024-01-01",
         auto_adjust=True,
         progress=False,
-        threads=True,
+        threads=False,
     )
-    if raw.empty:
-        raise ValueError("No data returned from Yahoo Finance.")
+    prices = _parse_yfinance_frame(raw, [ticker])
+    if ticker not in prices.columns:
+        raise ValueError(f"No price column returned for {ticker}.")
+    series = prices[ticker].dropna()
+    if len(series) < 2:
+        raise ValueError(f"Insufficient data returned for {ticker}.")
+    return ensure_naive_series(series)
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        prices = raw["Close"]
-    else:
-        prices = raw[["Close"]].rename(columns={"Close": all_tickers[0]})
 
-    prices = prices.dropna(how="all").sort_index()
-    prices.index = pd.to_datetime(prices.index).tz_localize(None)
-    prices = prices.loc[START_DATE:END_DATE]
+def _fetch_price_data_once(all_tickers: List[str]) -> Dict[str, pd.Series]:
+    download_arg: str | List[str] = all_tickers[0] if len(all_tickers) == 1 else all_tickers
+    raw = yf.download(
+        download_arg,
+        start=START_DATE,
+        end="2024-01-01",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+        group_by="column",
+    )
+    prices = _parse_yfinance_frame(raw, all_tickers)
 
     result: Dict[str, pd.Series] = {}
     for ticker in all_tickers:
-        if ticker in prices.columns:
-            result[ticker] = prices[ticker].dropna()
+        if ticker not in prices.columns:
+            continue
+        series = ensure_naive_series(prices[ticker].dropna())
+        if len(series) >= 2:
+            result[ticker] = series
+
+    missing = [ticker for ticker in all_tickers if ticker not in result]
+    if missing:
+        for ticker in missing:
+            result[ticker] = _download_ticker_series(ticker)
+
+    if BENCHMARK not in result:
+        raise ValueError(f"Benchmark ticker {BENCHMARK} could not be downloaded.")
+
     return result
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_price_data() -> Dict[str, pd.Series]:
+    """Download adjusted close prices for all tickers + benchmark with retries."""
+    all_tickers = list(dict.fromkeys(TICKERS + [BENCHMARK]))
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            result = _fetch_price_data_once(all_tickers)
+            if not result:
+                raise ValueError("No ticker data was returned from Yahoo Finance.")
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_DOWNLOAD_ATTEMPTS:
+                time.sleep(RETRY_WAIT_SECONDS)
+
+    raise ValueError(
+        f"Failed to download market data after {MAX_DOWNLOAD_ATTEMPTS} attempts. "
+        f"Last error: {last_error}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +311,8 @@ def run_backtest(
         )
 
     ret_series = pd.Series(daily_rets, index=aligned.index, name="returns")
-    eq_series = (1 + ret_series).cumprod()
+    eq_series = ensure_naive_series((1 + ret_series).cumprod())
+    ret_series = ensure_naive_series(ret_series)
     eq_series.name = "equity"
 
     metrics = compute_metrics(eq_series, ret_series, trades)
@@ -250,7 +340,8 @@ def buy_and_hold(prices: pd.Series) -> BacktestResult:
         )
 
     daily_ret = aligned.pct_change().fillna(0)
-    equity = (1 + daily_ret).cumprod()
+    equity = ensure_naive_series((1 + daily_ret).cumprod())
+    daily_ret = ensure_naive_series(daily_ret)
     trades: List[Trade] = []
     if len(aligned) >= 2:
         total_ret = aligned.iloc[-1] / aligned.iloc[0] - 1
@@ -313,8 +404,14 @@ def compute_metrics(
 
 
 def period_return(equity: pd.Series, start: str, end: str) -> float:
-    mask = (equity.index >= start) & (equity.index <= end)
-    sub = equity.loc[mask]
+    if not has_min_rows(equity):
+        return 0.0
+
+    eq = ensure_naive_series(equity)
+    start_dt = to_naive_timestamp(start)
+    end_dt = to_naive_timestamp(end)
+    mask = (eq.index >= start_dt) & (eq.index <= end_dt)
+    sub = eq.loc[mask]
     if len(sub) < 2:
         return 0.0
     return (sub.iloc[-1] / sub.iloc[0] - 1) * 100
@@ -669,8 +766,38 @@ def main() -> None:
         try:
             price_data = download_price_data()
         except Exception as exc:
-            st.error(f"Failed to download data: {exc}")
+            st.error(
+                "Unable to download market data from Yahoo Finance. "
+                f"Details: {exc}"
+            )
+            st.error(
+                "The app retried up to 3 times. Please refresh the page in a few "
+                "moments. If the issue continues, Yahoo Finance may be temporarily "
+                "unavailable from Streamlit Cloud."
+            )
             st.stop()
+
+        if BENCHMARK not in price_data:
+            st.error(
+                f"Benchmark data for {BENCHMARK} is missing. "
+                "Cannot run the backtester without a benchmark."
+            )
+            st.stop()
+
+        if len(price_data[BENCHMARK]) < 2:
+            st.error(
+                f"Benchmark data for {BENCHMARK} is incomplete "
+                f"({len(price_data[BENCHMARK])} rows returned). "
+                "Please refresh and try again."
+            )
+            st.stop()
+
+        missing_tickers = [ticker for ticker in TICKERS if ticker not in price_data]
+        if missing_tickers:
+            st.error(
+                "Some tickers could not be downloaded: "
+                + ", ".join(missing_tickers)
+            )
 
     benchmark_prices = price_data[BENCHMARK]
     benchmark_prices.name = BENCHMARK
@@ -678,7 +805,7 @@ def main() -> None:
     bench_metrics = benchmark_result.metrics
 
     # Pre-compute all strategy results (cached in session)
-    if "all_results_v4" not in st.session_state:
+    if "all_results_v5" not in st.session_state:
         all_results: Dict[str, Dict[str, BacktestResult]] = {}
         for strat_key in SIGNAL_GENERATORS:
             all_results[strat_key] = {}
@@ -688,9 +815,9 @@ def main() -> None:
                 series = price_data[ticker].copy()
                 series.name = ticker
                 all_results[strat_key][ticker] = run_backtest(series, strat_key)
-        st.session_state["all_results_v4"] = all_results
+        st.session_state["all_results_v5"] = all_results
 
-    all_results = st.session_state["all_results_v4"]
+    all_results = st.session_state["all_results_v5"]
 
     # Top row — selectors
     col_s, col_t, _ = st.columns([2, 2, 4])
